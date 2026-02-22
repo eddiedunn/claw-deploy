@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# oc — OpenClaw instance CLI wrapper
+#
+# Usage:
+#   oc <instance> <command...>        Run an openclaw command on an instance
+#   oc <instance> --shell             Drop into a shell inside the container
+#   oc <instance> --logs [N]          Tail container logs (default 50)
+#   oc list                           List all instances
+#   oc help                           Show this help
+#
+# Examples:
+#   oc default devices list
+#   oc default devices approve --latest
+#   oc default config set gateway.bind loopback
+#   oc research configure
+#   oc default --shell
+#   oc default --logs 100
+#
+# Works from anywhere — detects if running on the host or remotely.
+
+set -euo pipefail
+
+# --- Load config ---
+# Resolve through symlinks to find the real script location
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_SOURCE" ]]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+    SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+    [[ "$SCRIPT_SOURCE" != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+fi
+
+HOST="${OPENCLAW_HOST:-}"
+USER="${OPENCLAW_USER:-openclaw}"
+UID_NUM="${OPENCLAW_UID:-993}"
+HOME_DIR="${OPENCLAW_HOME:-/data/openclaw}"
+
+# --- Helpers ---
+usage() {
+    sed -n '2,/^$/s/^# \?//p' "$0"
+    exit 0
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+is_local() {
+    [[ -z "$HOST" ]] && return 0
+    local this_host
+    this_host="$(hostname -s 2>/dev/null || hostname)"
+    [[ "$this_host" == "$HOST" ]]
+}
+
+# Build the podman exec command
+build_exec_cmd() {
+    local instance="$1"
+    shift
+    local container_name
+
+    if [[ "$instance" == "default" ]]; then
+        container_name="openclaw"
+    else
+        container_name="openclaw-${instance}"
+    fi
+
+    # Detect if stdin is a terminal for interactive mode
+    local it_flag=""
+    if [[ -t 0 && -t 1 ]]; then
+        it_flag="-it"
+    fi
+
+    echo "podman exec ${it_flag} ${container_name} node dist/index.js $*"
+}
+
+# Build the log command
+build_logs_cmd() {
+    local instance="$1"
+    local lines="${2:-50}"
+    local container_name
+
+    if [[ "$instance" == "default" ]]; then
+        container_name="openclaw"
+    else
+        container_name="openclaw-${instance}"
+    fi
+
+    echo "podman logs --tail ${lines} ${container_name}"
+}
+
+# Build the shell command
+build_shell_cmd() {
+    local instance="$1"
+    local container_name
+
+    if [[ "$instance" == "default" ]]; then
+        container_name="openclaw"
+    else
+        container_name="openclaw-${instance}"
+    fi
+
+    echo "podman exec -it ${container_name} /bin/bash"
+}
+
+# Build the instance list command
+build_list_cmd() {
+    echo "bash ${HOME_DIR}/openclaw-instance.sh list"
+}
+
+# Wrap command for the service user (local execution on host)
+wrap_local() {
+    local cmd="$1"
+    echo "sudo -u ${USER} bash -c 'cd /tmp && XDG_RUNTIME_DIR=/run/user/${UID_NUM} ${cmd}'"
+}
+
+# Wrap command for remote execution via SSH
+wrap_remote() {
+    local cmd="$1"
+    local needs_tty="$2"
+
+    local ssh_flags="-o ConnectTimeout=5"
+    if [[ "$needs_tty" == "yes" && -t 0 && -t 1 ]]; then
+        ssh_flags="-t ${ssh_flags}"
+    fi
+
+    echo "ssh ${ssh_flags} ${HOST} 'sudo -u ${USER} bash -c \"cd /tmp && XDG_RUNTIME_DIR=/run/user/${UID_NUM} ${cmd}\"'"
+}
+
+# Execute a command string
+run_cmd() {
+    local cmd_str="$1"
+    eval "$cmd_str"
+}
+
+# --- Main ---
+[[ $# -lt 1 ]] && usage
+
+case "$1" in
+    help|--help|-h)
+        usage
+        ;;
+    list)
+        cmd="$(build_list_cmd)"
+        if is_local; then
+            run_cmd "$(wrap_local "$cmd")"
+        else
+            run_cmd "$(wrap_remote "$cmd" "no")"
+        fi
+        ;;
+    *)
+        instance="$1"
+        shift
+        [[ $# -lt 1 ]] && die "missing command. Usage: oc <instance> <command...>"
+
+        needs_tty="no"
+
+        case "$1" in
+            --shell)
+                cmd="$(build_shell_cmd "$instance")"
+                needs_tty="yes"
+                ;;
+            --logs)
+                shift
+                cmd="$(build_logs_cmd "$instance" "${1:-50}")"
+                ;;
+            *)
+                cmd="$(build_exec_cmd "$instance" "$@")"
+                # Interactive commands
+                case "$1" in
+                    configure|pairing|channels) needs_tty="yes" ;;
+                esac
+                ;;
+        esac
+
+        if is_local; then
+            run_cmd "$(wrap_local "$cmd")"
+        else
+            run_cmd "$(wrap_remote "$cmd" "$needs_tty")"
+        fi
+        ;;
+esac
