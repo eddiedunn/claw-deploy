@@ -36,10 +36,10 @@ if [[ -f "$ENV_FILE" ]]; then
     source "$ENV_FILE"
 fi
 
-HOST="${OPENCLAW_HOST:-}"
-USER="${OPENCLAW_USER:-openclaw}"
-UID_NUM="${OPENCLAW_UID:-993}"
-HOME_DIR="${OPENCLAW_HOME:-/data/openclaw}"
+OC_HOST="${OPENCLAW_HOST:-}"
+OC_USER="${OPENCLAW_USER:-openclaw}"
+OC_UID="${OPENCLAW_UID:-993}"
+OC_HOME="${OPENCLAW_HOME:-/data/openclaw}"
 
 # --- Helpers ---
 usage() {
@@ -50,90 +50,63 @@ usage() {
 die() { echo "error: $*" >&2; exit 1; }
 
 is_local() {
-    [[ -z "$HOST" ]] && return 0
+    [[ -z "$OC_HOST" ]] && return 0
     local this_host
     this_host="$(hostname -s 2>/dev/null || hostname)"
-    [[ "$this_host" == "$HOST" ]]
+    [[ "$this_host" == "$OC_HOST" ]]
 }
 
-# Build the podman exec command
-build_exec_cmd() {
+container_name() {
     local instance="$1"
+    if [[ "$instance" == "default" ]]; then
+        echo "openclaw"
+    else
+        echo "openclaw-${instance}"
+    fi
+}
+
+# Shell-quote a string for safe embedding in bash -c or ssh arguments
+shell_quote() {
+    printf '%q' "$1"
+}
+
+# Build a properly quoted command string from arguments
+quote_args() {
+    local quoted=""
+    local arg
+    for arg in "$@"; do
+        if [[ -n "$quoted" ]]; then
+            quoted+=" "
+        fi
+        quoted+="$(shell_quote "$arg")"
+    done
+    echo "$quoted"
+}
+
+# Run a command as the service user.
+# exec_as <needs_tty:yes|no> [command args...]
+exec_as() {
+    local needs_tty="$1"
     shift
-    local container_name
 
-    if [[ "$instance" == "default" ]]; then
-        container_name="openclaw"
+    local quoted_cmd
+    quoted_cmd="$(quote_args "$@")"
+    local inner="XDG_RUNTIME_DIR=/run/user/${OC_UID} ${quoted_cmd}"
+
+    if is_local; then
+        exec sudo -u "${OC_USER}" -- bash -c "cd /tmp && ${inner}"
     else
-        container_name="openclaw-${instance}"
+        if [[ "$needs_tty" == "yes" ]]; then
+            # -tt forces PTY allocation on both sides, critical for interactive
+            # commands (configure, --shell) to propagate the terminal through
+            # the full chain: ssh -> sudo -> bash -c -> podman exec -it
+            exec ssh -tt -o ConnectTimeout=5 "${OC_HOST}" \
+                "sudo -u ${OC_USER} -- bash -c $(shell_quote "cd /tmp && ${inner}")"
+        else
+            exec ssh -o ConnectTimeout=5 "${OC_HOST}" \
+                "sudo -u ${OC_USER} -- bash -c $(shell_quote "cd /tmp && ${inner}")"
+        fi
     fi
-
-    # Detect if stdin is a terminal for interactive mode
-    local it_flag=""
-    if [[ -t 0 && -t 1 ]]; then
-        it_flag="-it"
-    fi
-
-    echo "podman exec ${it_flag} ${container_name} node dist/index.js $*"
-}
-
-# Build the log command
-build_logs_cmd() {
-    local instance="$1"
-    local lines="${2:-50}"
-    local container_name
-
-    if [[ "$instance" == "default" ]]; then
-        container_name="openclaw"
-    else
-        container_name="openclaw-${instance}"
-    fi
-
-    echo "podman logs --tail ${lines} ${container_name}"
-}
-
-# Build the shell command
-build_shell_cmd() {
-    local instance="$1"
-    local container_name
-
-    if [[ "$instance" == "default" ]]; then
-        container_name="openclaw"
-    else
-        container_name="openclaw-${instance}"
-    fi
-
-    echo "podman exec -it ${container_name} /bin/bash"
-}
-
-# Build the instance list command
-build_list_cmd() {
-    echo "bash ${HOME_DIR}/openclaw-instance.sh list"
-}
-
-# Wrap command for the service user (local execution on host)
-wrap_local() {
-    local cmd="$1"
-    echo "sudo -u ${USER} bash -c 'cd /tmp && XDG_RUNTIME_DIR=/run/user/${UID_NUM} ${cmd}'"
-}
-
-# Wrap command for remote execution via SSH
-wrap_remote() {
-    local cmd="$1"
-    local needs_tty="$2"
-
-    local ssh_flags="-o ConnectTimeout=5"
-    if [[ "$needs_tty" == "yes" && -t 0 && -t 1 ]]; then
-        ssh_flags="-t ${ssh_flags}"
-    fi
-
-    echo "ssh ${ssh_flags} ${HOST} 'sudo -u ${USER} bash -c \"cd /tmp && XDG_RUNTIME_DIR=/run/user/${UID_NUM} ${cmd}\"'"
-}
-
-# Execute a command string
-run_cmd() {
-    local cmd_str="$1"
-    eval "$cmd_str"
 }
 
 # --- Main ---
@@ -144,42 +117,39 @@ case "$1" in
         usage
         ;;
     list)
-        cmd="$(build_list_cmd)"
-        if is_local; then
-            run_cmd "$(wrap_local "$cmd")"
-        else
-            run_cmd "$(wrap_remote "$cmd" "no")"
-        fi
+        exec_as "no" bash "${OC_HOME}/openclaw-instance.sh" list
         ;;
     *)
         instance="$1"
         shift
         [[ $# -lt 1 ]] && die "missing command. Usage: oc <instance> <command...>"
 
+        cname="$(container_name "$instance")"
         needs_tty="no"
 
         case "$1" in
             --shell)
-                cmd="$(build_shell_cmd "$instance")"
                 needs_tty="yes"
+                exec_as "$needs_tty" podman exec -it "${cname}" /bin/bash
                 ;;
             --logs)
                 shift
-                cmd="$(build_logs_cmd "$instance" "${1:-50}")"
+                lines="${1:-50}"
+                exec_as "$needs_tty" podman logs --tail "${lines}" "${cname}"
                 ;;
             *)
-                cmd="$(build_exec_cmd "$instance" "$@")"
-                # Interactive commands
+                # Detect interactive commands
                 case "$1" in
                     configure|pairing|channels) needs_tty="yes" ;;
                 esac
+
+                # Build podman exec with appropriate flags
+                if [[ "$needs_tty" == "yes" || ( -t 0 && -t 1 ) ]]; then
+                    exec_as "$needs_tty" podman exec -it "${cname}" node dist/index.js "$@"
+                else
+                    exec_as "$needs_tty" podman exec "${cname}" node dist/index.js "$@"
+                fi
                 ;;
         esac
-
-        if is_local; then
-            run_cmd "$(wrap_local "$cmd")"
-        else
-            run_cmd "$(wrap_remote "$cmd" "$needs_tty")"
-        fi
         ;;
 esac

@@ -97,6 +97,47 @@ bash openclaw-instance.sh start research    # Start it
 bash openclaw-instance.sh destroy research  # Remove it
 ```
 
+## CLI Wrapper (`oc`)
+
+`oc` is a POSIX shell wrapper that provides a unified interface for managing OpenClaw instances — both locally on the host and remotely via SSH. It auto-detects whether you are on the server or a remote machine and routes commands accordingly.
+
+### Install
+
+From the repo directory (works on any POSIX system):
+
+```bash
+ln -sf $(pwd)/oc ~/.local/bin/oc
+```
+
+Ensure `~/.local/bin` is in your `PATH`. The script resolves symlinks to find its `.env`, so the `.env` file must be alongside the real script.
+
+### Usage
+
+```
+oc <instance> <command...>        Run an openclaw command on an instance
+oc <instance> --shell             Drop into a shell inside the container
+oc <instance> --logs [N]          Tail container logs (default 50)
+oc list                           List all instances
+oc help                           Show this help
+```
+
+### Examples
+
+```bash
+oc default devices list
+oc default devices approve --latest
+oc default config set gateway.bind loopback
+oc research configure
+oc default --shell
+oc default --logs 100
+```
+
+### How it works
+
+- **Remote**: wraps commands in `ssh -t <host> 'sudo -u <user> ...'` using values from `.env`
+- **Local**: wraps commands in `sudo -u <user> ...` directly (detected via hostname match)
+- Interactive commands (`configure`, `--shell`, etc.) automatically allocate a TTY
+
 ## Architecture
 
 ```
