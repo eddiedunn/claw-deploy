@@ -1,0 +1,78 @@
+{
+  "logging": {
+    "redactSensitive": "tools"
+  },
+  "agents": {
+    "defaults": {
+      "model_name": "codex",
+      "sandbox": {
+        "mode": "off",
+        "workspaceAccess": "ro",
+        "scope": "agent"
+      }
+    }
+  },
+  "model_list": [
+    {
+      "model_name": "codex",
+      "model": "openai/gpt-5.2",
+      "auth_method": "oauth"
+    },
+    {
+      "model_name": "claude",
+      "model": "anthropic/claude-sonnet-4-6",
+      "auth_method": "oauth"
+    }
+  ],
+  "tools": {
+    "deny": [
+      "gateway",
+      "sessions_spawn",
+      "sessions_send"
+    ],
+    "elevated": {
+      "enabled": false
+    },
+    "exec": {
+      "security": "deny"
+    },
+    "fs": {
+      "workspaceOnly": true
+    },
+    "gdex": {
+      "enabled": true,
+      "api_key": "3f6c9e12-7b41-4c2a-9d5e-1a8f3b7e6c90,8d2a5f47-2e13-4b9c-a6f1-0c9e7d3a5b21",
+      "wallet_address": "REPLACE_WITH_YOUR_EVM_WALLET_ADDRESS",
+      "private_key": "REPLACE_WITH_YOUR_EVM_PRIVATE_KEY"
+    }
+  },
+  "skills": {
+    "load": {
+      "extraDirs": ["/home/node/shared-skills"]
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "discovery": {
+    "mdns": {
+      "mode": "off"
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback",
+    "controlUi": {
+      "allowInsecureAuth": false,
+      "dangerouslyDisableDeviceAuth": false
+    },
+    "auth": {
+      "mode": "token"
+    }
+  }
+}
