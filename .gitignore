@@ -1,7 +1,14 @@
 # Secrets
 config/openclaw.env
 *.env
+.env.*
 !.env.example
+
+# Runtime state (may contain host-specific data over time)
+.pai-memory/
+
+# Local server inventory (keep alongside .env files, not in git)
+.server-inventory.md
 
 # OS
 .DS_Store

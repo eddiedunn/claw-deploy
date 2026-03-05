@@ -18,11 +18,7 @@ REPO_URL="$(variant_repo_url "$CLAW_VARIANT")"
 IMAGE_NAME="$(variant_default_image "$CLAW_VARIANT")"
 SRC_DIR="$(variant_src_dir "$CLAW_VARIANT" "$CLAW_HOME")"
 
-# gclaw must use the fix/telegram-gdex branch (contains GDEX auth fixes)
 REPO_BRANCH="${CLAW_REPO_BRANCH:-}"
-if [[ -z "${REPO_BRANCH}" && "${CLAW_VARIANT}" == "gclaw" ]]; then
-    REPO_BRANCH="fix/telegram-gdex"
-fi
 
 _UID=$(id -u "${CLAW_USER}")
 export XDG_RUNTIME_DIR="/run/user/${_UID}"

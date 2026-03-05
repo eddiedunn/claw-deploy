@@ -53,6 +53,9 @@ EnvironmentFile=${OPENCLAW_HOME}/.openclaw/.env
 Environment=HOME=/home/node
 Environment=TERM=xterm-256color
 
+# Secrets (injected as env vars from podman secret store — never on disk)
+Secret=OPENCLAW_GATEWAY_TOKEN,type=env
+
 # DNS (MagicDNS + fallback)
 DNS=${OPENCLAW_DNS_PRIMARY}
 DNS=${OPENCLAW_DNS_FALLBACK}

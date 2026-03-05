@@ -18,12 +18,14 @@ CONFIG_DIR="$(variant_state_dir "$CLAW_VARIANT" "default" "$CLAW_HOME")"
 CONFIG_FILENAME="$(variant_config_filename "$CLAW_VARIANT")"
 TOKEN_VAR="$(variant_token_env_var "$CLAW_VARIANT")"
 WORKSPACE_DIR="${CLAW_HOME}/workspace"
+CLAW_UID="$(id -u "${CLAW_USER}")"
+PODMAN_ENV="XDG_RUNTIME_DIR=/run/user/${CLAW_UID}"
 
 # Create directories
 sudo -u "${CLAW_USER}" mkdir -p "${CONFIG_DIR}"
 sudo -u "${CLAW_USER}" mkdir -p "${WORKSPACE_DIR}"
 
-# Generate gateway token
+# Generate gateway token and store as podman secret (never written to disk)
 GATEWAY_TOKEN=$(openssl rand -hex 32)
 
 # Write config JSON (variant-specific format)
@@ -94,12 +96,8 @@ if [[ "${CLAW_VARIANT}" == "picoclaw" ]]; then
   }
 }
 CONFIGEOF
-elif [[ "${CLAW_VARIANT}" == "gclaw" ]]; then
-    # GDEX credentials: read from .env if set, otherwise use placeholders
-    _GDEX_API_KEY="${GDEX_API_KEY:-3f6c9e12-7b41-4c2a-9d5e-1a8f3b7e6c90,8d2a5f47-2e13-4b9c-a6f1-0c9e7d3a5b21}"
-    _WALLET_ADDRESS="${WALLET_ADDRESS:-REPLACE_WITH_YOUR_EVM_WALLET_ADDRESS}"
-    _PRIVATE_KEY="${PRIVATE_KEY:-REPLACE_WITH_YOUR_EVM_PRIVATE_KEY}"
-    cat > "${CONFIG_DIR}/${CONFIG_FILENAME}" << CONFIGEOF
+elif [[ "${CLAW_VARIANT}" == "tradeclaw" ]]; then
+    cat > "${CONFIG_DIR}/${CONFIG_FILENAME}" << 'CONFIGEOF'
 {
   "gateway": {
     "mode": "local",
@@ -125,10 +123,9 @@ elif [[ "${CLAW_VARIANT}" == "gclaw" ]]; then
   "agents": {
     "defaults": {
       "model_name": "codex",
+      "max_tokens": 32768,
       "sandbox": {
-        "mode": "all",
-        "scope": "agent",
-        "workspaceAccess": "ro"
+        "mode": "off"
       }
     }
   },
@@ -137,15 +134,10 @@ elif [[ "${CLAW_VARIANT}" == "gclaw" ]]; then
       "model_name": "codex",
       "model": "openai/gpt-5.2",
       "auth_method": "oauth"
-    },
-    {
-      "model_name": "claude",
-      "model": "anthropic/claude-sonnet-4-6",
-      "auth_method": "oauth"
     }
   ],
   "tools": {
-    "deny": ["gateway", "cron", "sessions_spawn", "sessions_send"],
+    "deny": ["gateway", "sessions_spawn", "sessions_send"],
     "fs": {
       "workspaceOnly": true
     },
@@ -155,11 +147,9 @@ elif [[ "${CLAW_VARIANT}" == "gclaw" ]]; then
     "elevated": {
       "enabled": false
     },
-    "gdex": {
+    "trading": {
       "enabled": true,
-      "api_key": "${_GDEX_API_KEY}",
-      "wallet_address": "${_WALLET_ADDRESS}",
-      "private_key": "${_PRIVATE_KEY}"
+      "fork_mode": false
     }
   },
   "session": {
@@ -235,20 +225,16 @@ else
 CONFIGEOF
 fi
 
-# Write .env with variant-specific token var name
-if [[ "${CLAW_VARIANT}" == "picoclaw" ]]; then
-    cat > "${CONFIG_DIR}/.env" << ENVEOF
-${TOKEN_VAR}=${GATEWAY_TOKEN}
+# Store gateway token as a podman secret (never written to disk)
+printf "%s" "${GATEWAY_TOKEN}" | \
+    sudo -u "${CLAW_USER}" env "${PODMAN_ENV}" podman secret create --replace "${TOKEN_VAR}" -
+
+# Write .env for non-secret runtime config (token is injected via podman secret at runtime)
+sudo -u "${CLAW_USER}" tee "${CONFIG_DIR}/.env" > /dev/null << 'ENVEOF'
+# Non-secret runtime environment variables for this variant.
+# Secrets (gateway token, Telegram bot token, private keys) are managed via
+# podman secret create — do NOT add secret values here.
 ENVEOF
-elif [[ "${CLAW_VARIANT}" == "gclaw" ]]; then
-    cat > "${CONFIG_DIR}/.env" << ENVEOF
-${TOKEN_VAR}=${GATEWAY_TOKEN}
-ENVEOF
-else
-    cat > "${CONFIG_DIR}/.env" << ENVEOF
-${TOKEN_VAR}=${GATEWAY_TOKEN}
-ENVEOF
-fi
 
 # Set ownership
 chown -R "${CLAW_USER}:${CLAW_USER}" "${CONFIG_DIR}"
@@ -256,17 +242,14 @@ chown -R "${CLAW_USER}:${CLAW_USER}" "${WORKSPACE_DIR}"
 
 echo "Configuration written to ${CONFIG_DIR}/${CONFIG_FILENAME}"
 echo "Environment file written to ${CONFIG_DIR}/.env"
-echo "Gateway token generated (saved in .env)"
+echo "Gateway token stored as podman secret: ${TOKEN_VAR}"
 echo ""
-echo "NEXT: Add Telegram bot token to ${CONFIG_DIR}/.env"
+echo "NEXT: Store Telegram bot token as podman secret (as service user):"
+echo "      printf '%s' '<token>' | sudo -u ${CLAW_USER} env ${PODMAN_ENV} podman secret create --replace TELEGRAM_BOT_TOKEN -"
 if [[ "${CLAW_VARIANT}" == "picoclaw" ]]; then
     echo "NEXT: After container starts, run OpenAI OAuth login:"
     echo "      ${CLAW_VARIANT} auth login --provider openai"
     echo "      (Device code flow — works headlessly)"
-elif [[ "${CLAW_VARIANT}" == "gclaw" ]]; then
-    echo "NEXT: After container starts, run Codex OAuth login (PKCE flow):"
-    echo "      gclaw auth login --provider openai"
-    echo "      (Prints auth URL — paste redirect URL back when prompted)"
 else
     echo "NEXT: Add ANTHROPIC_API_KEY to ${CONFIG_DIR}/.env"
     echo "NEXT: Run OAuth login after container starts"

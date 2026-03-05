@@ -4,7 +4,6 @@ Rootless Podman deployment for claw-family AI agent platforms with Telegram inte
 
 - **[OpenClaw](https://github.com/openclaw/openclaw)** — open-source AI agent platform
 - **[PicoClaw](https://github.com/picoclaw/picoclaw)** — lightweight variant
-- **[Gclaw](https://github.com/gclaw/gclaw)** — fork of PicoClaw
 - **[Tradeclaw](https://github.com/eddiedunn/tradeclaw)** — fork of PicoClaw for direct Base chain trading (Go binary)
 
 ## Setup
@@ -122,16 +121,22 @@ claw default gateway restart
 Symptom:
 - `gateway token mismatch` when running CLI commands.
 
-Fix (on host):
+Fix (on host): the token comes from the podman secret, not `.env`. Rotate it to resync the secret and the in-app config:
 
 ```bash
 SVC_USER="${CLAW_USER:-openclaw}"
 SVC_UID="$(id -u "$SVC_USER")"
-CLAW_HOME="${CLAW_HOME:-/data/openclaw}"
 VARIANT="${CLAW_VARIANT:-openclaw}"
-TOKEN="$(sudo -u "$SVC_USER" sed -n "s/^${VARIANT^^}_GATEWAY_TOKEN=//p" "$CLAW_HOME/.${VARIANT}/.env")"
-sudo -u "$SVC_USER" XDG_RUNTIME_DIR="/run/user/$SVC_UID" podman exec -i "$VARIANT" node dist/index.js config set gateway.auth.token "$TOKEN"
-sudo -u "$SVC_USER" XDG_RUNTIME_DIR="/run/user/$SVC_UID" podman exec -i "$VARIANT" node dist/index.js config set gateway.remote.token "$TOKEN"
+NEW_TOKEN="$(openssl rand -hex 32)"
+
+# Replace podman secret
+printf "%s" "$NEW_TOKEN" | sudo -u "$SVC_USER" XDG_RUNTIME_DIR="/run/user/$SVC_UID" podman secret create --replace "${VARIANT^^}_GATEWAY_TOKEN" -
+
+# Update config.json inside the (still-running) container
+sudo -u "$SVC_USER" XDG_RUNTIME_DIR="/run/user/$SVC_UID" podman exec -i "$VARIANT" node dist/index.js config set gateway.auth.token "$NEW_TOKEN"
+sudo -u "$SVC_USER" XDG_RUNTIME_DIR="/run/user/$SVC_UID" podman exec -i "$VARIANT" node dist/index.js config set gateway.remote.token "$NEW_TOKEN"
+
+# Restart so the container picks up the new secret
 sudo -u "$SVC_USER" XDG_RUNTIME_DIR="/run/user/$SVC_UID" systemctl --user restart "${VARIANT}.service"
 ```
 
@@ -157,7 +162,13 @@ ssh -L 18789:127.0.0.1:18789 your-server
 # Open http://localhost:18789
 ```
 
-Gateway token is in `<CLAW_HOME>/.<variant>/.env`.
+Gateway token is stored as a podman secret (`${VARIANT^^}_GATEWAY_TOKEN`). Retrieve it with:
+
+```bash
+SVC_USER="${CLAW_USER:-openclaw}"
+SVC_UID="$(id -u "$SVC_USER")"
+sudo -u "$SVC_USER" XDG_RUNTIME_DIR="/run/user/$SVC_UID" podman secret inspect "${VARIANT^^}_GATEWAY_TOKEN"
+```
 
 ### Backups
 
@@ -237,12 +248,21 @@ claw default --logs 100
 │   └── Resources: configurable RAM + CPU limits
 ├── State: .<variant>/                  # e.g. .openclaw/, .picoclaw/
 │   ├── <variant>.json          # Config
-│   ├── .env                    # Gateway token
+│   ├── .env                    # Non-secret runtime config (token via podman secret)
 │   ├── agents/                 # Auth profiles, sessions
 │   ├── credentials/            # Telegram pairing
 │   └── sandboxes/              # Agent skills + identity
 ├── Workspace: workspace/
 └── Backups: backups/           # Daily, 14-day retention
+
+# Optional: OAuth Broker service (user: oauthbroker, home: /data/oauth-broker)
+├── Pod: oauth-broker
+│   ├── oauth-broker container  — FastAPI broker, 127.0.0.1:8420 (loopback only)
+│   └── oauth-broker-redis      — Redis sidecar (pod-internal, no host port)
+└── /data/oauth-broker/
+    ├── data/                   # SQLite (encrypted refresh tokens)
+    ├── redis-data/             # Redis persistence
+    └── .env                    # Non-secret config (OB_ENCRYPTION_KEY via podman secret)
 ```
 
 Default ports per variant:
@@ -251,7 +271,6 @@ Default ports per variant:
 |-----------|---------|--------|---------|
 | openclaw  | 18789   | 18790  | Node.js |
 | picoclaw  | 28789   | 28790  | Node.js |
-| gclaw     | 38789   | 38790  | Node.js |
 | tradeclaw | 48789   | 48790  | Go      |
 
 ## Variant Notes
@@ -273,6 +292,10 @@ sudo -u tradeclaw -H bash -c "cd /data/tradeclaw && XDG_RUNTIME_DIR=/run/user/\$
 ```
 
 Auth tokens are saved to the mounted volume (`/data/tradeclaw/.tradeclaw/`) and survive image rebuilds and container restarts.
+
+### Fork Mode (Tradeclaw)
+
+Test trading tools against a local Anvil fork of Base mainnet — no real funds used. Set `TRADECLAW_FORK_MODE=true` and start Anvil with `make fork`. See [RUNBOOK.md](RUNBOOK.md#fork-mode-testing) for details.
 
 ### Podman < 4.4 (no Quadlet support)
 
@@ -349,6 +372,82 @@ unqualified-search-registries = ["docker.io"]
 EOF
 ```
 
+## Services
+
+Standalone services that claw variants can consume. Each service lives under `services/<name>/` and follows the same numbered-script deployment pattern as the main variants.
+
+### OAuth Broker
+
+The OAuth Broker (`services/oauth-broker/`) is a FastAPI service (port 8420) that centralizes OAuth token management for one or more claw instances. It solves two problems: race conditions when multiple instances try to refresh the same single-use refresh token simultaneously, and repeated re-authentication prompts when access tokens expire.
+
+Once deployed, claw variants call `GET http://127.0.0.1:8420/token/{provider}` (Anthropic or OpenAI) instead of managing tokens themselves.
+
+#### Pod-based deployment
+
+The broker runs as a **Podman pod** containing two containers that share a network namespace:
+
+- `oauth-broker` — FastAPI token broker (port 8420, loopback only on host)
+- `oauth-broker-redis` — Redis 7-alpine sidecar (pod-internal only, no host port)
+
+Sharing a pod namespace means the broker reaches Redis at `localhost:6379` without any host-level port exposure for Redis.
+
+#### Deployment sequence
+
+Set `CLAW_REPO_URL` in `services/oauth-broker/.env` (copy from `.env.example`), then run as root on the target host:
+
+```bash
+bash services/oauth-broker/01-create-user.sh    # Create oauthbroker system user (UID 989)
+bash services/oauth-broker/02-setup-podman.sh   # Configure rootless Podman
+bash services/oauth-broker/03-build.sh          # Clone repo + build oauth-broker:local image
+bash services/oauth-broker/04-configure.sh      # Generate OB_ENCRYPTION_KEY secret + write .env
+bash services/oauth-broker/05-deploy-quadlet.sh # Deploy pod quadlet (auto-starts on boot)
+```
+
+After deployment, enable and start the service as the `oauthbroker` user:
+
+```bash
+systemctl --machine oauthbroker@ --user daemon-reload
+systemctl --machine oauthbroker@ --user enable --now oauth-broker.service
+```
+
+Verify the service is up:
+
+```bash
+# Health check (via SSH tunnel or from the host)
+curl http://127.0.0.1:8420/health
+
+# Provider status
+curl http://127.0.0.1:8420/status
+```
+
+#### Initial OAuth authentication
+
+Each OAuth provider requires a one-time browser-based login. From a machine with browser access, open an SSH tunnel and visit the auth URL:
+
+```bash
+# On your local machine
+ssh -L 8420:127.0.0.1:8420 your-server
+
+# Trigger Anthropic login (prints auth URL)
+curl http://localhost:8420/auth/anthropic/login
+
+# Trigger OpenAI login
+curl http://localhost:8420/auth/openai/login
+```
+
+Open the printed URL in a browser, complete the OAuth flow, and the broker stores the refresh token (encrypted at rest via `OB_ENCRYPTION_KEY`).
+
+#### Key configuration variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CLAW_REPO_URL` | (required) | Git URL for the oauth-service repo |
+| `CLAW_PORT` | `8420` | Host port the broker listens on |
+| `OB_ENCRYPTION_KEY` | (podman secret) | Fernet key for refresh tokens at rest |
+| `OB_CALLBACK_BASE_URL` | `http://localhost:8420` | Base URL for OAuth callbacks |
+
+See `services/oauth-broker/.env.example` for all options.
+
 ## Security
 
 | Control | Detail |
@@ -357,12 +456,40 @@ EOF
 | Rootless Podman | User namespace isolation via subuid/subgid |
 | Loopback-only ports | Host binds to 127.0.0.1, access via SSH tunnel only |
 | Token auth | Gateway requires token for all connections |
+| Podman secrets | Credentials injected via `--secret NAME,type=env`, not `.env` files |
 | Exec denied | `tools.exec.security: "deny"` |
 | Dangerous tools denied | `gateway`, `sessions_spawn`, `sessions_send` blocked |
 | Sandbox off | Container itself is the isolation boundary |
 | Filesystem restricted | `tools.fs.workspaceOnly: true` |
 | mDNS off | `discovery.mdns.mode: "off"` |
 | Log redaction | `logging.redactSensitive: "tools"` |
+
+### Secrets Management
+
+Sensitive credentials use **podman secrets** instead of `.env` files. This keeps secrets out of the filesystem (and out of git history if `.env` files are accidentally committed).
+
+| Secret | Purpose | Rotation frequency |
+|--------|---------|--------------------|
+| `PRIVATE_KEY` | EVM wallet key for on-chain trading | On compromise, or when rotating wallets |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot authentication | On compromise |
+| `${VARIANT^^}_GATEWAY_TOKEN` | Gateway API authentication | Periodic or on compromise |
+| `OB_ENCRYPTION_KEY` | Fernet key for OAuth refresh tokens at rest (oauth-broker) | On compromise |
+
+**Creating secrets** (on the deployment host, as the service user):
+
+```bash
+printf "%s" "secret-value" | XDG_RUNTIME_DIR=/run/user/$(id -u $USER) podman secret create SECRET_NAME -
+```
+
+**Using secrets in systemd service** (add to the `podman run` command):
+
+```bash
+--secret PRIVATE_KEY,type=env --secret TELEGRAM_BOT_TOKEN,type=env --secret TRADECLAW_GATEWAY_TOKEN,type=env
+```
+
+Non-sensitive configuration (`BASE_RPC_URL`, `ZEROX_API_KEY`, `TZ`) remains in the `.env` file loaded via `--env-file`.
+
+See [RUNBOOK.md](RUNBOOK.md#secrets-management) for rotation procedures and emergency response.
 
 ## Troubleshooting
 
