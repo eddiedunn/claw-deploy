@@ -1,0 +1,68 @@
+{
+  "logging": {
+    "redactSensitive": "tools"
+  },
+  "agents": {
+    "defaults": {
+      "model_name": "codex",
+      "max_tokens": 32768,
+      "sandbox": {
+        "mode": "off",
+        "workspaceAccess": "ro",
+        "scope": "agent"
+      }
+    }
+  },
+  "model_list": [
+    {
+      "model_name": "codex",
+      "model": "openai/gpt-5.2",
+      "auth_method": "oauth"
+    }
+  ],
+  "tools": {
+    "deny": [
+      "gateway",
+      "sessions_spawn",
+      "sessions_send"
+    ],
+    "elevated": {
+      "enabled": false
+    },
+    "exec": {
+      "security": "deny"
+    },
+    "fs": {
+      "workspaceOnly": true
+    }
+  },
+  "skills": {
+    "load": {
+      "extraDirs": ["/home/node/shared-skills"]
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "discovery": {
+    "mdns": {
+      "mode": "off"
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback",
+    "controlUi": {
+      "allowInsecureAuth": false,
+      "dangerouslyDisableDeviceAuth": false
+    },
+    "auth": {
+      "mode": "token"
+    }
+  }
+}

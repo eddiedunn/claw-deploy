@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# claw — Claw Deploy instance CLI wrapper
+#
+# Usage:
+#   claw <instance> <command...>        Run a command on an instance
+#   claw <instance> --shell             Drop into a shell inside the container
+#   claw <instance> --logs [N]          Tail container logs (default 50)
+#   claw list                           List all instances
+#   claw help                           Show this help
+#
+# Examples:
+#   claw default devices list
+#   claw default devices approve --latest
+#   claw default config set gateway.bind loopback
+#   claw research configure
+#   claw default auth login --provider openai
+#   claw default --shell
+#   claw default --logs 100
+#
+# Works from anywhere — detects if running on the host or remotely.
+
+set -euo pipefail
+
+# --- Load config ---
+# Resolve through symlinks to find the real script location
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_SOURCE" ]]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+    SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+    [[ "$SCRIPT_SOURCE" != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+fi
+
+# shellcheck source=lib/variant.sh
+source "${SCRIPT_DIR}/lib/variant.sh"
+
+CL_HOST="${CLAW_HOST:-}"
+CL_SSH_USER="${CLAW_SSH_USER:-}"
+CL_USER="${CLAW_USER:-openclaw}"
+CL_UID="${CLAW_UID:-993}"
+CL_HOME="${CLAW_HOME:-/data/openclaw}"
+
+# --- Helpers ---
+usage() {
+    sed -n '2,/^$/s/^# \?//p' "$0"
+    exit 0
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+is_local() {
+    [[ -z "$CL_HOST" ]] && return 0
+    local this_host
+    this_host="$(hostname -s 2>/dev/null || hostname)"
+    [[ "$this_host" == "$CL_HOST" ]]
+}
+
+ssh_target() {
+    [[ -z "$CL_HOST" ]] && return 1
+    if [[ "$CL_HOST" == *@* ]]; then
+        echo "$CL_HOST"
+    elif [[ -n "$CL_SSH_USER" ]]; then
+        echo "${CL_SSH_USER}@${CL_HOST}"
+    else
+        echo "$CL_HOST"
+    fi
+}
+
+# Look up the variant for an instance from the instance registry
+instance_variant() {
+    local instance="$1"
+    local registry="${CL_HOME}/.instance-registry"
+    if [[ ! -f "$registry" ]]; then
+        # Fallback: check legacy .port-registry
+        if [[ -f "${CL_HOME}/.port-registry" ]]; then
+            # Legacy format has no variant column — assume openclaw
+            echo "openclaw"
+            return
+        fi
+        echo "${CLAW_VARIANT:-openclaw}"
+        return
+    fi
+    local line
+    line=$(grep "^${instance}:" "$registry" 2>/dev/null | head -1) || true
+    if [[ -n "$line" ]]; then
+        echo "$line" | cut -d: -f2
+    else
+        echo "${CLAW_VARIANT:-openclaw}"
+    fi
+}
+
+container_name() {
+    local instance="$1"
+    local variant
+    variant="$(instance_variant "$instance")"
+    variant_container_name "$variant" "$instance"
+}
+
+# Shell-quote a string for safe embedding in bash -c or ssh arguments
+shell_quote() {
+    printf '%q' "$1"
+}
+
+# Build a properly quoted command string from arguments
+quote_args() {
+    local quoted=""
+    local arg
+    for arg in "$@"; do
+        if [[ -n "$quoted" ]]; then
+            quoted+=" "
+        fi
+        quoted+="$(shell_quote "$arg")"
+    done
+    echo "$quoted"
+}
+
+# Run a command as the service user.
+# exec_as <needs_tty:yes|no> [command args...]
+exec_as() {
+    local needs_tty="$1"
+    shift
+
+    local quoted_cmd
+    quoted_cmd="$(quote_args "$@")"
+    local inner="XDG_RUNTIME_DIR=/run/user/${CL_UID} ${quoted_cmd}"
+
+    if is_local; then
+        exec sudo -u "${CL_USER}" -- bash -c "cd /tmp && ${inner}"
+    else
+        local target
+        target="$(ssh_target)"
+        if [[ "$needs_tty" == "yes" ]]; then
+            # -tt forces PTY allocation on both sides, critical for interactive
+            # commands (configure, --shell) to propagate the terminal through
+            # the full chain: ssh -> sudo -> bash -c -> podman exec -it
+            exec ssh -tt -o ConnectTimeout=5 "${target}" \
+                "sudo -u ${CL_USER} -- bash -c $(shell_quote "cd /tmp && ${inner}")"
+        else
+            exec ssh -o ConnectTimeout=5 "${target}" \
+                "sudo -u ${CL_USER} -- bash -c $(shell_quote "cd /tmp && ${inner}")"
+        fi
+    fi
+}
+
+# --- Main ---
+[[ $# -lt 1 ]] && usage
+
+case "$1" in
+    help|--help|-h)
+        usage
+        ;;
+    list)
+        exec_as "no" bash "${CL_HOME}/claw-instance.sh" list
+        ;;
+    *)
+        instance="$1"
+        shift
+        [[ $# -lt 1 ]] && die "missing command. Usage: claw <instance> <command...>"
+
+        cname="$(container_name "$instance")"
+        needs_tty="no"
+
+        case "$1" in
+            --shell)
+                needs_tty="yes"
+                exec_as "$needs_tty" podman exec -it "${cname}" /bin/bash
+                ;;
+            --logs)
+                shift
+                lines="${1:-50}"
+                exec_as "$needs_tty" podman logs --tail "${lines}" "${cname}"
+                ;;
+            *)
+                # Detect interactive commands
+                case "$1" in
+                    configure|pairing|channels|auth) needs_tty="yes" ;;
+                esac
+
+                # Build podman exec with appropriate flags
+                if [[ "$needs_tty" == "yes" || ( -t 0 && -t 1 ) ]]; then
+                    exec_as "$needs_tty" podman exec -it "${cname}" node dist/index.js "$@"
+                else
+                    exec_as "$needs_tty" podman exec "${cname}" node dist/index.js "$@"
+                fi
+                ;;
+        esac
+        ;;
+esac
